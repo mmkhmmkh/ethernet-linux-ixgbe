@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 1999 - 2024 Intel Corporation */
+/* Copyright (C) 1999 - 2026 Intel Corporation */
 
 #include "ixgbe_type.h"
 #include "ixgbe_mbx.h"
@@ -81,6 +81,9 @@ s32 ixgbe_poll_mbx(struct ixgbe_hw *hw, u32 *msg, u16 size, u16 mbx_id)
  *
  * returns SUCCESS if it successfully copied message into the buffer and
  * received an ACK to that message within specified period
+ *
+ * Note that the caller to this function must lock before calling, since
+ * multiple threads can destroy each other messages.
  **/
 s32 ixgbe_write_mbx(struct ixgbe_hw *hw, u32 *msg, u16 size, u16 mbx_id)
 {
@@ -402,6 +405,13 @@ STATIC s32 ixgbe_obtain_mbx_lock_vf(struct ixgbe_hw *hw)
 	while (countdown--) {
 		/* Reserve mailbox for VF use */
 		vf_mailbox = ixgbe_read_mailbox_vf(hw);
+
+		/* Check if other thread holds the VF lock or it is held by
+		 * the PF
+		 */
+		if (vf_mailbox & (IXGBE_VFMAILBOX_VFU | IXGBE_VFMAILBOX_PFU))
+			goto retry;
+
 		vf_mailbox |= IXGBE_VFMAILBOX_VFU;
 		IXGBE_WRITE_REG(hw, IXGBE_VFMAILBOX, vf_mailbox);
 
@@ -411,6 +421,7 @@ STATIC s32 ixgbe_obtain_mbx_lock_vf(struct ixgbe_hw *hw)
 			break;
 		}
 
+	retry:
 		/* Wait a bit before trying again */
 		usec_delay(mbx->usec_delay);
 	}
@@ -520,7 +531,7 @@ STATIC s32 ixgbe_write_mbx_vf(struct ixgbe_hw *hw, u32 *msg, u16 size,
 	/* lock the mailbox to prevent pf/vf race condition */
 	ret_val = ixgbe_obtain_mbx_lock_vf(hw);
 	if (ret_val)
-		goto out;
+		return ret_val;
 
 	/* flush msg and acks as we are overwriting the message buffer */
 	ixgbe_clear_msg_vf(hw);
@@ -538,11 +549,11 @@ STATIC s32 ixgbe_write_mbx_vf(struct ixgbe_hw *hw, u32 *msg, u16 size,
 	vf_mailbox |= IXGBE_VFMAILBOX_REQ;
 	IXGBE_WRITE_REG(hw, IXGBE_VFMAILBOX, vf_mailbox);
 
-	/* if msg sent wait until we receive an ack */
-	ixgbe_poll_for_ack(hw, mbx_id);
+	/* release the mailbox lock */
+	ixgbe_release_mbx_lock_vf(hw, 0);
 
-out:
-	hw->mbx.ops[mbx_id].release(hw, mbx_id);
+	/* if msg sent wait until we receive an ack */
+	ixgbe_poll_for_ack(hw, 0);
 
 	return ret_val;
 }
@@ -835,6 +846,13 @@ STATIC s32 ixgbe_obtain_mbx_lock_pf(struct ixgbe_hw *hw, u16 vf_id)
 	while (countdown--) {
 		/* Reserve mailbox for PF use */
 		pf_mailbox = IXGBE_READ_REG(hw, IXGBE_PFMAILBOX(vf_id));
+
+		/* Check if other thread holds the PF lock or it is held by
+		 * the VF
+		 */
+		if (pf_mailbox & (IXGBE_PFMAILBOX_PFU | IXGBE_PFMAILBOX_VFU))
+			goto retry;
+
 		pf_mailbox |= IXGBE_PFMAILBOX_PFU;
 		IXGBE_WRITE_REG(hw, IXGBE_PFMAILBOX(vf_id), pf_mailbox);
 
@@ -845,6 +863,7 @@ STATIC s32 ixgbe_obtain_mbx_lock_pf(struct ixgbe_hw *hw, u16 vf_id)
 			break;
 		}
 
+	retry:
 		/* Wait a bit before trying again */
 		usec_delay(mbx->usec_delay);
 	}
@@ -907,7 +926,7 @@ STATIC s32 ixgbe_write_mbx_pf_legacy(struct ixgbe_hw *hw, u32 *msg, u16 size,
 	for (i = 0; i < size; i++)
 		IXGBE_WRITE_REG_ARRAY(hw, IXGBE_PFMBMEM(vf_id), i, msg[i]);
 
-	/* Interrupt VF to tell it a message has been sent and release buffer*/
+	/* Interrupt VF to tell it a message has been sent and release buffer */
 	IXGBE_WRITE_REG(hw, IXGBE_PFMAILBOX(vf_id), IXGBE_PFMAILBOX_STS);
 
 	/* update stats */
@@ -937,7 +956,7 @@ STATIC s32 ixgbe_write_mbx_pf(struct ixgbe_hw *hw, u32 *msg, u16 size,
 	/* lock the mailbox to prevent pf/vf race condition */
 	ret_val = ixgbe_obtain_mbx_lock_pf(hw, vf_id);
 	if (ret_val)
-		goto out;
+		return ret_val;
 
 	/* flush msg and acks as we are overwriting the message buffer */
 	ixgbe_clear_msg_pf(hw, vf_id);
@@ -947,22 +966,22 @@ STATIC s32 ixgbe_write_mbx_pf(struct ixgbe_hw *hw, u32 *msg, u16 size,
 	for (i = 0; i < size; i++)
 		IXGBE_WRITE_REG_ARRAY(hw, IXGBE_PFMBMEM(vf_id), i, msg[i]);
 
-	/* Interrupt VF to tell it a message has been sent */
+	/* interrupt VF to tell it a message has been sent */
 	pf_mailbox = IXGBE_READ_REG(hw, IXGBE_PFMAILBOX(vf_id));
 	pf_mailbox |= IXGBE_PFMAILBOX_STS;
 	IXGBE_WRITE_REG(hw, IXGBE_PFMAILBOX(vf_id), pf_mailbox);
 
+	/* release the mailbox lock */
+	ixgbe_release_mbx_lock_pf(hw, vf_id);
+
 	/* if msg sent wait until we receive an ack */
-	ixgbe_poll_for_ack(hw, vf_id);
+	if (msg[0] & IXGBE_VT_MSGTYPE_CTS)
+		ixgbe_poll_for_ack(hw, vf_id);
 
 	/* update stats */
 	hw->mbx.stats.msgs_tx++;
 
-out:
-	hw->mbx.ops[vf_id].release(hw, vf_id);
-
 	return ret_val;
-
 }
 
 /**
@@ -1104,8 +1123,8 @@ void ixgbe_init_mbx_params_pf(struct ixgbe_hw *hw)
 	    hw->mac.type != ixgbe_mac_X550 &&
 	    hw->mac.type != ixgbe_mac_X550EM_x &&
 	    hw->mac.type != ixgbe_mac_X550EM_a &&
-	    hw->mac.type != ixgbe_mac_E610 &&
-	    hw->mac.type != ixgbe_mac_X540)
+	    hw->mac.type != ixgbe_mac_X540 &&
+	    !ixgbe_is_mac_E6xx(hw->mac.type))
 		return;
 
 	/* Initialize common mailbox settings */
@@ -1147,8 +1166,8 @@ void ixgbe_upgrade_mbx_params_pf(struct ixgbe_hw *hw, u16 vf_id)
 	    hw->mac.type != ixgbe_mac_X550 &&
 	    hw->mac.type != ixgbe_mac_X550EM_x &&
 	    hw->mac.type != ixgbe_mac_X550EM_a &&
-	    hw->mac.type != ixgbe_mac_E610 &&
-	    hw->mac.type != ixgbe_mac_X540)
+	    hw->mac.type != ixgbe_mac_X540 &&
+	    !ixgbe_is_mac_E6xx(hw->mac.type))
 		return;
 
 	mbx->timeout = IXGBE_VF_MBX_INIT_TIMEOUT;

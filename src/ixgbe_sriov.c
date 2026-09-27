@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 1999 - 2024 Intel Corporation */
+/* Copyright (C) 1999 - 2026 Intel Corporation */
+
+#include "ixgbe.h"
 
 #include <linux/types.h>
 #include <linux/module.h>
@@ -12,7 +14,6 @@
 #include <linux/tcp.h>
 #include <linux/ipv6.h>
 
-#include "ixgbe.h"
 #include "ixgbe_type.h"
 #include "ixgbe_sriov.h"
 
@@ -293,7 +294,11 @@ int ixgbe_disable_sriov(struct ixgbe_adapter *adapter)
 	if (adapter->ring_feature[RING_F_VMDQ].limit == 1)
 		adapter->flags &= ~IXGBE_FLAG_VMDQ_ENABLED;
 
-	adapter->flags &= ~IXGBE_FLAG_SRIOV_ENABLED;
+	adapter->flags &= ~(IXGBE_FLAG_SRIOV_ENABLED |
+			    IXGBE_FLAG_SRIOV_REPLICATION_ENABLE |
+			    IXGBE_FLAG_SRIOV_L2SWITCH_ENABLE);
+	if (hw->mac.type != ixgbe_mac_82598EB)
+		adapter->flags2 |= IXGBE_FLAG2_RSC_CAPABLE;
 	adapter->ring_feature[RING_F_VMDQ].offset = 0;
 
 	/* take a breather then clean up driver data */
@@ -404,6 +409,17 @@ static int ixgbe_pci_sriov_disable(struct pci_dev *dev)
 	return err;
 }
 
+/**
+ * ixgbe_pci_sriov_configure - Configure SR-IOV for the PCI device
+ * @dev: PCI device structure
+ * @num_vfs: Number of virtual functions (VFs) to configure
+ *
+ * This function configures Single Root I/O Virtualization (SR-IOV) for the
+ * specified PCI device. If `num_vfs` is zero, it disables SR-IOV. Otherwise,
+ * it enables SR-IOV with the specified number of VFs.
+ *
+ * Return: The number of VFs enabled on success, or a negative error code on failure.
+ */
 int ixgbe_pci_sriov_configure(struct pci_dev *dev, int num_vfs)
 {
 	if (num_vfs == 0)
@@ -514,6 +530,39 @@ int ixgbe_set_vf_vlan(struct ixgbe_adapter *adapter, int add, int vid, u32 vf)
 
 	return err;
 }
+
+static void ixgbe_update_maxfrs(struct ixgbe_adapter *adapter, u32 max_frs)
+{
+	struct net_device *dev = adapter->netdev;
+	u32 new_max_frs;
+	int i;
+
+	new_max_frs = dev->mtu + ETH_HLEN + ETH_FCS_LEN;
+
+	switch (adapter->hw.mac.type) {
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+	case ixgbe_mac_E610:
+		new_max_frs += IXGBE_TS_HDR_LEN;
+	default:
+		break;
+	}
+
+	for (i = 0; i < adapter->num_vfs; i++) {
+		if (adapter->vfinfo[i].max_frame > new_max_frs)
+			new_max_frs = adapter->vfinfo[i].max_frame;
+	}
+
+	/* Recalculate max_frs on each call. Update only if changed.
+	 * It may decrease when VFs lower their MTU.
+	 */
+	if (max_frs != new_max_frs) {
+		max_frs = new_max_frs << IXGBE_MHADD_MFS_SHIFT;
+		IXGBE_WRITE_REG(&adapter->hw, IXGBE_MAXFRS, max_frs);
+	}
+}
+
 static int ixgbe_set_vf_lpe(struct ixgbe_adapter *adapter, u32 max_frame, u32 vf)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
@@ -534,7 +583,11 @@ static int ixgbe_set_vf_lpe(struct ixgbe_adapter *adapter, u32 max_frame, u32 vf
 		s32 err = 0;
 
 #if IS_ENABLED(CONFIG_FCOE)
+#ifdef HAVE_NETDEV_FCOE_MTU
+		if (dev->fcoe_mtu)
+#else
 		if (dev->features & NETIF_F_FCOE_MTU)
+#endif
 			pf_max_frame = max_t(int, pf_max_frame,
 					     IXGBE_FCOE_JUMBO_FRAME_SIZE);
 #endif /* CONFIG_FCOE */
@@ -543,6 +596,8 @@ static int ixgbe_set_vf_lpe(struct ixgbe_adapter *adapter, u32 max_frame, u32 vf
 		case ixgbe_mbox_api_11:
 		case ixgbe_mbox_api_12:
 		case ixgbe_mbox_api_13:
+		case ixgbe_mbox_api_16:
+		case ixgbe_mbox_api_17:
 			/* Version 1.1 supports jumbo frames on VFs if PF has
 			 * jumbo frames enabled which means legacy VFs are
 			 * disabled
@@ -584,10 +639,11 @@ static int ixgbe_set_vf_lpe(struct ixgbe_adapter *adapter, u32 max_frame, u32 vf
 	max_frs &= IXGBE_MHADD_MFS_MASK;
 	max_frs >>= IXGBE_MHADD_MFS_SHIFT;
 
-	if (max_frs < max_frame) {
-		max_frs = max_frame << IXGBE_MHADD_MFS_SHIFT;
-		IXGBE_WRITE_REG(hw, IXGBE_MAXFRS, max_frs);
-	}
+	/* Preserve the current VF max_frame for future max_frs calculations */
+	adapter->vfinfo[vf].max_frame = max_frame;
+
+	/* Recalculate MAXFRS as max of PF and all active VFs */
+	ixgbe_update_maxfrs(adapter, max_frs);
 
 	e_info(hw, "VF requests change max MTU to %d\n", max_frame);
 
@@ -980,9 +1036,8 @@ static int ixgbe_set_vf_vlan_msg(struct ixgbe_adapter *adapter,
 		return 0;
 
 	err = ixgbe_set_vf_vlan(adapter, add, vid, vf);
-
 	if (err)
-		return err;
+		goto out;
 
 #ifdef HAVE_VLAN_RX_REGISTER
 	/* in case of promiscuous mode any VLAN filter set for a VF must
@@ -991,7 +1046,7 @@ static int ixgbe_set_vf_vlan_msg(struct ixgbe_adapter *adapter,
 	if (add && adapter->netdev->flags & IFF_PROMISC) {
 		err = ixgbe_set_vf_vlan(adapter, add, vid, VMDQ_P(0));
 		if (err)
-			return err;
+			goto out;
 	}
 
 #ifdef CONFIG_PCI_IOV
@@ -1030,11 +1085,9 @@ static int ixgbe_set_vf_vlan_msg(struct ixgbe_adapter *adapter,
 			err = ixgbe_set_vf_vlan(adapter, add, vid, VMDQ_P(0));
 	}
 
-out:
 #endif /* CONFIG_PCI_IOV */
-#else /* HAVE_VLAN_RX_REGISTER */
-	return 0;
 #endif /* HAVE_VLAN_RX_REGISTER */
+out:
 	return err;
 }
 
@@ -1092,6 +1145,8 @@ static int ixgbe_negotiate_vf_api(struct ixgbe_adapter *adapter,
 	case ixgbe_mbox_api_11:
 	case ixgbe_mbox_api_12:
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		adapter->vfinfo[vf].vf_api = api;
 		return 0;
 	default:
@@ -1117,6 +1172,8 @@ static int ixgbe_get_vf_queues(struct ixgbe_adapter *adapter,
 	case ixgbe_mbox_api_11:
 	case ixgbe_mbox_api_12:
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		break;
 	default:
 		return -1;
@@ -1160,6 +1217,8 @@ static int ixgbe_get_vf_reta(struct ixgbe_adapter *adapter, u32 *msgbuf, u32 vf)
 	switch (adapter->vfinfo[vf].vf_api) {
 	case ixgbe_mbox_api_12:
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1192,6 +1251,8 @@ static int ixgbe_get_vf_rss_key(struct ixgbe_adapter *adapter,
 	switch (adapter->vfinfo[vf].vf_api) {
 	case ixgbe_mbox_api_12:
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1218,6 +1279,8 @@ static int ixgbe_update_vf_xcast_mode(struct ixgbe_adapter *adapter,
 			return -EOPNOTSUPP;
 		/* Fall threw */
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1287,12 +1350,64 @@ static int ixgbe_get_vf_link_state(struct ixgbe_adapter *adapter,
 	switch (adapter->vfinfo[vf].vf_api) {
 	case ixgbe_mbox_api_12:
 	case ixgbe_mbox_api_13:
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
 	*link_state = adapter->vfinfo[vf].link_enable;
+
+	return 0;
+}
+
+static int ixgbe_get_vf_link_status(struct ixgbe_adapter *adapter,
+				    u32 *msgbuf, u32 vf)
+{
+	struct ixgbe_hw *hw = &adapter->hw;
+
+	switch (adapter->vfinfo[vf].vf_api) {
+	case ixgbe_mbox_api_16:
+	case ixgbe_mbox_api_17:
+		if (!ixgbe_is_mac_E6xx(hw->mac.type))
+			return -EOPNOTSUPP;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/* Simply provide stored values as watchdog / link status events take
+	 * care of it's freshness.
+	 */
+	msgbuf[1] = adapter->link_speed;
+	msgbuf[2] = adapter->link_up;
+
+	return 0;
+}
+
+/**
+ * ixgbe_negotiate_vf_features -  negotiate supported features with VF driver
+ * @adapter: pointer to adapter struct
+ * @msgbuf: pointer to message buffers
+ * @vf: VF identifier
+ *
+ * Return: 0 on success or -EOPNOTSUPP when operation is not supported.
+ */
+static int ixgbe_negotiate_vf_features(struct ixgbe_adapter *adapter,
+				       u32 *msgbuf, u32 vf)
+{
+	u32 features = msgbuf[1];
+
+	switch (adapter->vfinfo[vf].vf_api) {
+	case ixgbe_mbox_api_17:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	features &= IXGBE_SUPPORTED_FEATURES;
+	msgbuf[1] = features;
 
 	return 0;
 }
@@ -1371,6 +1486,12 @@ static int ixgbe_rcv_msg_from_vf(struct ixgbe_adapter *adapter, u32 vf)
 		break;
 	case IXGBE_VF_GET_LINK_STATE:
 		retval = ixgbe_get_vf_link_state(adapter, msgbuf, vf);
+		break;
+	case IXGBE_VF_GET_PF_LINK_STATE:
+		retval = ixgbe_get_vf_link_status(adapter, msgbuf, vf);
+		break;
+	case IXGBE_VF_FEATURES_NEGOTIATE:
+		retval = ixgbe_negotiate_vf_features(adapter, msgbuf, vf);
 		break;
 	default:
 		e_err(drv, "Unhandled Msg %8.8x\n", msgbuf[0]);
@@ -1455,7 +1576,10 @@ void ixgbe_msg_task(struct ixgbe_adapter *adapter)
 	struct ixgbe_hw *hw = &adapter->hw;
 	u32 vf;
 
-	if (adapter->flags & IXGBE_FLAG_MDD_ENABLED && adapter->vfinfo)
+	if (!adapter->vfinfo)
+		return;
+
+	if (adapter->flags & IXGBE_FLAG_MDD_ENABLED)
 		ixgbe_check_mdd_event(adapter);
 
 	for (vf = 0; vf < adapter->num_vfs; vf++) {
@@ -1517,6 +1641,18 @@ void ixgbe_set_all_vfs(struct ixgbe_adapter *adapter)
 }
 
 #ifdef HAVE_NDO_SET_VF_TRUST
+/**
+ * ixgbe_ndo_set_vf_trust - Set trust status for a virtual function (VF)
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @setting: Boolean value to set the VF as trusted (true) or not trusted (false)
+ *
+ * This function sets the trust status for a specified virtual function (VF) on
+ * the network device. If the trust status changes, the VF is reset to reconfigure
+ * its features. The function logs the new trust status of the VF.
+ *
+ * Return: 0 on success, or -EINVAL if the VF index is out of range.
+ */
 int ixgbe_ndo_set_vf_trust(struct net_device *netdev, int vf, bool setting)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
@@ -1538,9 +1674,25 @@ int ixgbe_ndo_set_vf_trust(struct net_device *netdev, int vf, bool setting)
 
 	return 0;
 }
+#endif /* HAVE_NDO_SET_VF_TRUST */
 
-#endif
 #ifdef IFLA_VF_MAX
+/**
+ * ixgbe_ndo_set_vf_mac - Set MAC address for a virtual function (VF)
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @mac: Pointer to the MAC address to be set
+ *
+ * This function sets or removes the MAC address for a specified virtual
+ * function (VF) on the network device. It validates the MAC address and
+ * updates the VF configuration. If a valid MAC address is provided, it sets
+ * the MAC address and marks it as set by the PF. If a zero MAC address is
+ * provided, it removes the existing MAC address. The function logs relevant
+ * messages and warns if the PF device is down.
+ *
+ * Return: 0 on success, -EINVAL if the VF index is out of range or the MAC
+ *         address is invalid, or a negative error code on failure.
+ */
 int ixgbe_ndo_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
@@ -1558,7 +1710,7 @@ int ixgbe_ndo_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
 		if (retval >= 0) {
 			adapter->vfinfo[vf].pf_set_mac = true;
 
-			if (test_bit(__IXGBE_DOWN, &adapter->state)) {
+			if (test_bit(__IXGBE_DOWN, adapter->state)) {
 				dev_warn(ixgbe_pf_to_dev(adapter), "The VF MAC address has been set, but the PF device is not up.\n");
 				dev_warn(ixgbe_pf_to_dev(adapter), "Bring the PF device up before attempting to use the VF device.\n");
 			}
@@ -1613,7 +1765,7 @@ static int ixgbe_enable_port_vlan(struct ixgbe_adapter *adapter,
 	adapter->vfinfo[vf].pf_qos = qos;
 	dev_info(ixgbe_pf_to_dev(adapter),
 		 "Setting VLAN %d, QOS 0x%x on VF %d\n", vlan, qos, vf);
-	if (test_bit(__IXGBE_DOWN, &adapter->state)) {
+	if (test_bit(__IXGBE_DOWN, adapter->state)) {
 		dev_warn(ixgbe_pf_to_dev(adapter), "The VF VLAN has been set, but the PF device is not up.\n");
 		dev_warn(ixgbe_pf_to_dev(adapter), "Bring the PF device up before attempting to use the VF device.\n");
 	}
@@ -1644,12 +1796,29 @@ static int ixgbe_disable_port_vlan(struct ixgbe_adapter *adapter, int vf)
 	return err;
 }
 
+/**
+ * ixgbe_ndo_set_vf_vlan - Set VLAN configuration for a virtual function (VF)
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @vlan: VLAN ID to be set
+ * @qos: Quality of Service (QoS) priority
+ * @vlan_proto: (Optional) VLAN protocol, typically ETH_P_8021Q
+ *
+ * This function sets the VLAN configuration for a specified virtual function
+ * (VF) on the network device. It validates the VLAN ID and QoS values, and
+ * ensures the VLAN protocol is supported. If a VLAN is already set, it is
+ * disabled before setting the new configuration. The function handles both
+ * enabling and disabling of port VLANs for the VF.
+ *
+ * Return: 0 on success, -EINVAL if the VF index, VLAN ID, or QoS is invalid,
+ *         or -EPROTONOSUPPORT if the VLAN protocol is unsupported.
+ */
 #ifdef IFLA_VF_VLAN_INFO_MAX
 int ixgbe_ndo_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan,
 			  u8 qos, __be16 vlan_proto)
-#else
+#else /* IFLA_VF_VLAN_INFO_MAX */
 int ixgbe_ndo_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos)
-#endif
+#endif /* IFLA_VF_VLAN_INFO_MAX */
 {
 	int err = 0;
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
@@ -1774,6 +1943,22 @@ void ixgbe_check_vf_rate_limit(struct ixgbe_adapter *adapter)
 	}
 }
 
+/**
+ * ixgbe_ndo_set_vf_bw - Set bandwidth limit for a virtual function (VF)
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @min_tx_rate: Minimum transmit rate (unused)
+ * @max_tx_rate: Maximum transmit rate in Mbps
+ *
+ * This function sets the maximum bandwidth limit for a specified virtual
+ * function (VF) on the network device. It verifies that the VF is active,
+ * the link is up, and the link speed is 10 Gbps. The function ensures that
+ * the specified rate is within valid limits and updates the hardware
+ * configuration accordingly.
+ *
+ * Return: 0 on success, -EINVAL if the VF index is out of range or the rate
+ *         is invalid, or -EOPNOTSUPP if rate limiting is not supported.
+ */
 #ifdef HAVE_NDO_SET_VF_MIN_MAX_TX_RATE
 int ixgbe_ndo_set_vf_bw(struct net_device *netdev,
 			int vf,
@@ -1812,9 +1997,22 @@ int ixgbe_ndo_set_vf_bw(struct net_device *netdev, int vf, int max_tx_rate)
 
 	return 0;
 }
-
 #endif /* IFLA_VF_MAX */
+
 #if IS_ENABLED(CONFIG_PCI_IOV)
+/**
+ * ixgbe_ndo_set_vf_spoofchk - Enable or disable spoof checking for a VF
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @setting: Boolean value to enable (true) or disable (false) spoof checking
+ *
+ * This function enables or disables MAC and VLAN spoof checking for a specified
+ * virtual function (VF) on the network device. It updates the VF's spoof check
+ * setting and configures the hardware accordingly. For certain hardware, it
+ * also configures Ethertype anti-spoofing for LLDP and FC.
+ *
+ * Return: 0 on success, or -EINVAL if the VF index is out of range.
+ */
 int ixgbe_ndo_set_vf_spoofchk(struct net_device *netdev, int vf, bool setting)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
@@ -1847,9 +2045,9 @@ int ixgbe_ndo_set_vf_spoofchk(struct net_device *netdev, int vf, bool setting)
 
 		hw->mac.ops.set_ethertype_anti_spoofing(hw, setting, vf);
 	}
+
 	return 0;
 }
-
 #endif /* CONFIG_PCI_IOV */
 
 /**
@@ -1889,7 +2087,11 @@ static void ixgbe_set_vf_rx_tx(struct ixgbe_adapter *adapter, int vf)
 		int pf_max_frame = dev->mtu + ETH_HLEN;
 
 #if IS_ENABLED(CONFIG_FCOE)
+#ifdef HAVE_NETDEV_FCOE_MTU
+		if (dev->fcoe_mtu)
+#else
 		if (dev->features & NETIF_F_FCOE_MTU)
+#endif
 			pf_max_frame = max_t(int, pf_max_frame,
 					     IXGBE_FCOE_JUMBO_FRAME_SIZE);
 #endif /* CONFIG_FCOE */
@@ -1921,7 +2123,7 @@ void ixgbe_set_vf_link_state(struct ixgbe_adapter *adapter, int vf, int state)
 
 	switch (state) {
 	case IFLA_VF_LINK_STATE_AUTO:
-		if (test_bit(__IXGBE_DOWN, &adapter->state))
+		if (test_bit(__IXGBE_DOWN, adapter->state))
 			adapter->vfinfo[vf].link_enable = false;
 		else
 			adapter->vfinfo[vf].link_enable = true;
@@ -1989,6 +2191,19 @@ out:
 
 #ifdef IFLA_VF_MAX
 #ifdef HAVE_NDO_SET_VF_RSS_QUERY_EN
+/**
+ * ixgbe_ndo_set_vf_rss_query_en - Enable or disable RSS query for a VF
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @setting: Boolean value to enable (true) or disable (false) RSS query
+ *
+ * This function enables or disables the Receive Side Scaling (RSS) query
+ * capability for a specified virtual function (VF) on the network device.
+ * The operation is supported only for 82599 and X540 devices.
+ *
+ * Return: 0 on success, -EINVAL if the VF index is out of range, or
+ *         -EOPNOTSUPP if the operation is not supported on the device.
+ */
 int ixgbe_ndo_set_vf_rss_query_en(struct net_device *netdev, int vf,
 				  bool setting)
 {
@@ -2008,8 +2223,21 @@ int ixgbe_ndo_set_vf_rss_query_en(struct net_device *netdev, int vf,
 
 	return 0;
 }
-
 #endif
+
+/**
+ * ixgbe_ndo_get_vf_config - Retrieve configuration for a virtual function (VF)
+ * @netdev: Network device structure
+ * @vf: VF index
+ * @ivi: Pointer to ifla_vf_info structure to be filled with VF configuration
+ *
+ * This function retrieves the configuration for a specified virtual function
+ * (VF) on the network device. It populates the `ifla_vf_info` structure with
+ * details such as the VF's MAC address, VLAN, QoS, and other attributes. The
+ * function supports additional parameters based on kernel capabilities.
+ *
+ * Return: 0 on success, or -EINVAL if the VF index is out of range.
+ */
 int ixgbe_ndo_get_vf_config(struct net_device *netdev,
 			    int vf, struct ifla_vf_info *ivi)
 {

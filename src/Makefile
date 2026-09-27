@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 1999 - 2024 Intel Corporation
+# Copyright (C) 1999 - 2026 Intel Corporation
 
 ifneq ($(KERNELRELEASE),)
+src ?= .
+include $(src)/common.mk
+
 # kbuild part of makefile
 #
 # Makefile for the Intel(R) 10GbE PCI Express Linux Network Driver
@@ -41,6 +44,7 @@ ixgbe-${CONFIG_DEBUG_FS} += ixgbe_debugfs.o
 ixgbe-${CONFIG_FCOE:m=y} += ixgbe_fcoe.o
 
 ixgbe-$(CONFIG_PTP_1588_CLOCK:m=y) += ixgbe_ptp.o
+ixgbe-$(CONFIG_PTP_1588_CLOCK:m=y) += ixgbe_ptp_e610.o
 
 ixgbe-${CONFIG_SYSFS} += ixgbe_sysfs.o
 
@@ -50,6 +54,10 @@ ixgbe-y += kcompat_pldmfw.o
 endif
 
 ixgbe-y += kcompat.o
+
+ifeq ($(shell grep HAVE_XARRAY_API $(src)/kcompat_generated_defs.h),)
+ixgbe-y += kcompat_xarray.o
+endif
 
 else	# ifneq($(KERNELRELEASE),)
 # normal makefile

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 1999 - 2024 Intel Corporation */
+/* Copyright (C) 1999 - 2026 Intel Corporation */
 
 /* glue for the OS independent part of ixgbe
  * includes register access macros
@@ -8,12 +8,12 @@
 #ifndef _IXGBE_OSDEP_H_
 #define _IXGBE_OSDEP_H_
 
+#include "kcompat.h"
 #include <linux/pci.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/if_ether.h>
 #include <linux/sched.h>
-#include "kcompat.h"
 
 #define IXGBE_CPU_TO_BE16(_x) cpu_to_be16(_x)
 #define IXGBE_BE16_TO_CPU(_x) be16_to_cpu(_x)

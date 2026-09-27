@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 1999 - 2024 Intel Corporation */
+/* Copyright (C) 1999 - 2026 Intel Corporation */
 
 #include "ixgbe.h"
 #include "ixgbe_sriov.h"
@@ -54,7 +54,6 @@ static bool ixgbe_cache_ring_dcb_vmdq(struct ixgbe_adapter *adapter)
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_X550EM_a:
-		fallthrough;
 	case ixgbe_mac_E610:
 		/* start at VMDq register offset for SR-IOV enabled setups */
 		reg_idx = vmdq->offset * __ALIGN_MASK(1, ~vmdq->mask);
@@ -134,7 +133,6 @@ static void ixgbe_get_first_reg_idx(struct ixgbe_adapter *adapter, u8 tc,
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_X550EM_a:
-		fallthrough;
 	case ixgbe_mac_E610:
 		if (num_tcs > 4) {
 			/*
@@ -373,7 +371,6 @@ static bool ixgbe_set_dcb_vmdq_queues(struct ixgbe_adapter *adapter)
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_X550EM_a:
-		fallthrough;
 	case ixgbe_mac_E610:
 
 		/* Add starting offset to total pool count */
@@ -586,7 +583,6 @@ static bool ixgbe_set_vmdq_queues(struct ixgbe_adapter *adapter)
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_X550EM_a:
-		fallthrough;
 	case ixgbe_mac_E610:
 
 		/* Add starting offset to total pool count */
@@ -1072,7 +1068,7 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
 		 * can be marked as checksum errors.
 		 */
 		if (adapter->hw.mac.type == ixgbe_mac_82599EB)
-			set_bit(__IXGBE_RX_CSUM_UDP_ZERO_ERR, &ring->state);
+			set_bit(__IXGBE_RX_CSUM_UDP_ZERO_ERR, ring->state);
 
 #if IS_ENABLED(CONFIG_FCOE)
 		if (adapter->flags & IXGBE_FLAG_FCOE_ENABLED) {
@@ -1081,7 +1077,7 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
 
 			if ((rxr_idx >= f->offset) &&
 			    (rxr_idx < f->offset + f->indices)) {
-				set_bit(__IXGBE_RX_FCOE, &ring->state);
+				set_bit(__IXGBE_RX_FCOE, ring->state);
 			}
 		}
 #endif /* CONFIG_FCOE */
@@ -1101,6 +1097,12 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
 		ring++;
 	}
 
+#ifdef HAVE_PTP_1588_CLOCK
+	/* Init PTP structures. */
+	INIT_LIST_HEAD(&q_vector->ptp_skbs_e610);
+	spin_lock_init(&q_vector->ptp_skbs_lock_e610);
+
+#endif /* HAVE_PTP_1588_CLOCK */
 	return 0;
 }
 
@@ -1362,7 +1364,7 @@ int ixgbe_init_interrupt_scheme(struct ixgbe_adapter *adapter)
 		   (adapter->num_rx_queues > 1) ? "Enabled" : "Disabled",
 		   adapter->num_rx_queues, adapter->num_tx_queues);
 #endif
-	set_bit(__IXGBE_DOWN, &adapter->state);
+	set_bit(__IXGBE_DOWN, adapter->state);
 
 	return IXGBE_SUCCESS;
 }
